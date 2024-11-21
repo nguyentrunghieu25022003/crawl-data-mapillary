@@ -1,0 +1,9 @@
+{
+    "proxy": {
+        "http": "${PROXY_HTTP}",
+        "https": "${PROXY_HTTP}",
+        "no_proxy": "localhost,127.0.0.1",
+        "username": "${PROXY_USERNAME}",
+        "password": "${PROXY_PASSWORD}"
+    }
+}
