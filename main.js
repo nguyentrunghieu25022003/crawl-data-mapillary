@@ -2,7 +2,6 @@ const express = require("express");
 const morgan = require("morgan");
 const path = require("path");
 const fs = require("fs");
-const puppeteer = require("puppeteer");
 const { chromium } = require("playwright");
 const StealthPlugin = require("puppeteer-extra-plugin-stealth");
 const Queue = require("bull");
@@ -42,12 +41,10 @@ const config = JSON.parse(
 );
 
 app.use(morgan("combined"));
-/* puppeteer.use(StealthPlugin()); */
 
 app.get("/crawl", async (req, res) => {
   let browser;
-  const url =
-    "https://www.mapillary.com/app/leaderboard/Vietnam?location=Vietnam&lat=20&lng=0&z=1.5";
+  const url = "https://www.mapillary.com/app/leaderboard/Vietnam?location=Vietnam&lat=20&lng=0&z=1.5";
 
   if (!url) {
     return res.status(400).json({ error: "Please provide a valid URL." });
@@ -75,7 +72,7 @@ app.get("/crawl", async (req, res) => {
       await randomSleep(1000, 2000);
       console.log("Clicking All time tab...");
       await page.click(allTimeTabSelector);
-      await page.waitForSelector("div.pb1.px1.ng-star-inserted",{
+      await page.waitForSelector("div.pb1.px1.ng-star-inserted", {
         waitUntil: "domcontentloaded",
         timeout: 90000,
       });
@@ -132,9 +129,13 @@ async function waitForSelectorWithRetry(page, selector, retries = 4, delay = 200
       return;
     } catch (err) {
       attempt++;
-      console.warn(`Attempt ${attempt} failed for selector ${selector}. Retrying in ${delay}ms...`);
+      console.warn(
+        `Attempt ${attempt} failed for selector ${selector}. Retrying in ${delay}ms...`
+      );
       if (attempt >= retries) {
-        throw new Error(`All ${retries} attempts to wait for ${selector} failed.`);
+        throw new Error(
+          `All ${retries} attempts to wait for ${selector} failed.`
+        );
       }
       await new Promise((resolve) => setTimeout(resolve, delay));
     }
@@ -153,46 +154,82 @@ async function moveMouseRandomly(page, boundingBox) {
   console.log("Mouse moved over the element.");
 };
 
-async function getCoverContainerImageUrl(page) {
-  try {
-    console.log("Waiting for mapillary-cover-background...");
-    await page.waitForFunction(() => {
-      const element = document.querySelector("div.mapillary-cover-background");
-      if (!element) return false;
-    
-      const style = window.getComputedStyle(element);
-      return style.display !== "none" && style.visibility !== "hidden" && style.opacity !== "0";
-    }, { timeout: 60000 });
+async function trackImageUrls(page, containerSelector, imageUrls, maxDuration = 60000, maxImages = 500) {
+  console.log("Starting to track image URLs...");
 
-    console.log("Found mapillary-cover-background. Waiting for image to load...");
-    await page.waitForFunction(() => {
-      const element = document.querySelector("div.mapillary-cover-background");
-      if (!element) return false;
+  const startTime = Date.now();
+  let idleTime = 0;
 
-      const style = window.getComputedStyle(element);
-      return style.backgroundImage && style.backgroundImage !== "none";
-    }, { timeout: 60000 });
+  await page.evaluate((selector) => {
+    const targetNode = document.querySelector(selector);
+    if (!targetNode) {
+      console.warn("Container not found for tracking!");
+      return;
+    }
 
-    console.log("Image loaded. Extracting background image URL...");
+    window.collectedImageUrls = window.collectedImageUrls || [];
 
-    const backgroundElement = await page.$("div.mapillary-cover-background");
-    if (backgroundElement) {
-      const styleAttribute = await backgroundElement.evaluate((el) => el.style.backgroundImage);
-      const match = styleAttribute.match(/url\("(.*)"\)/);
-      if (match && match[1]) {
-        const imageUrl = match[1];
-        console.log("Extracted Image URL:", imageUrl);
-        return imageUrl;
-      } else {
-        console.warn("No valid background-image URL found.");
+    const observer = new MutationObserver((mutationsList) => {
+      for (const mutation of mutationsList) {
+        if (mutation.type === "attributes" && mutation.attributeName === "style") {
+          const backgroundImage = window.getComputedStyle(mutation.target).backgroundImage;
+          const match = backgroundImage.match(/url\("(.*)"\)/);
+          if (match && match[1]) {
+            const imageUrl = match[1];
+            if (!window.collectedImageUrls.some((item) => item.image === imageUrl)) {
+              window.collectedImageUrls.push({ image: imageUrl });
+              console.log("New Image URL detected:", imageUrl);
+            }
+          }
+        }
+      }
+    });
+
+    observer.observe(targetNode, { attributes: true });
+    console.log("Observer attached to:", selector);
+  }, containerSelector);
+
+  while (Date.now() - startTime < maxDuration) {
+    const urls = await page.evaluate(() => window.collectedImageUrls || []);
+    const newUrls = urls.filter(
+      (item) => !imageUrls.some((existing) => existing.image === item.image)
+    );
+
+    if (newUrls.length > 0) {
+      for (const newUrl of newUrls) {
+        const currentUrl = await page.url();
+        const urlObj = new URL(currentUrl);
+        const latitude = urlObj.searchParams.get("lat");
+        const longitude = urlObj.searchParams.get("lng");
+
+        imageUrls.push({
+          Image: newUrl.image,
+          Coordinates: {
+            Lat: latitude || "Unknown",
+            Long: longitude || "Unknown",
+          },
+        });
+
+        console.log(`New Image with Coordinates: ${newUrl.image}, Lat: ${latitude}, Lng: ${longitude}`);
+      }
+
+      idleTime = 0;
+
+      if (imageUrls.length >= maxImages) {
+        console.log(`Reached the maximum image limit (${maxImages}). Stopping.`);
+        break;
       }
     } else {
-      console.warn("mapillary-cover-background not found.");
+      idleTime += 1000;
+      if (idleTime >= 10000) {
+        console.log("No new images detected for 10 seconds. Stopping.");
+        break;
+      }
     }
-  } catch (err) {
-    console.error("Error fetching cover container image URL:", err.message);
+    await page.waitForTimeout(1000);
   }
-  return null;
+
+  console.log("Finished tracking image URLs.");
 };
 
 crawlQueue.process(async (job) => {
@@ -202,7 +239,7 @@ crawlQueue.process(async (job) => {
   const userUrl = `https://www.mapillary.com/app/user/${username}`;
   const retries = 5;
   const delay = 3000;
-  
+
   const crawlData = async () => {
     let browser;
     if (browser) {
@@ -215,11 +252,11 @@ crawlQueue.process(async (job) => {
           "--disable-setuid-sandbox",
           "--no-sandbox",
           "--disable-software-rasterizer",
-          "--disable-blink-features=AutomationControlled"
+          "--disable-blink-features=AutomationControlled",
           `--proxy-server=${config.proxy.http}`,
         ],
       });
-  
+
       const context = await browser.newContext({
         userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
         proxy: {
@@ -233,15 +270,14 @@ crawlQueue.process(async (job) => {
 
       await page.goto(userUrl, { waitUntil: "networkidle", timeout: 120000 });
       await randomSleep(1000, 20000);
-      
+
       await waitForSelectorWithRetry(page, "drawer-sequence-item.ng-star-inserted", 5, 3000);
       const elements = await page.$$("drawer-sequence-item.ng-star-inserted");
       console.log(`Found ${elements.length} leaderboard elements.`);
       if (!elements.length) {
         throw new Error("No user elements found.");
       }
-      await randomSleep(200, 500);
-      const imageUrls = [];
+      await randomSleep(100, 500);
       for (const element of elements) {
         try {
           console.log(`Processing element...`);
@@ -249,7 +285,9 @@ crawlQueue.process(async (job) => {
           const isVisible = !!boundingBox;
           if (!isVisible) {
             console.log("Element is not visible in viewport.");
-            await element.evaluate((el) => el.scrollIntoView({ behavior: "smooth", block: "center" }));
+            await element.evaluate((el) =>
+              el.scrollIntoView({ behavior: "smooth", block: "center" })
+            );
           }
           await randomSleep(100, 500);
           if (boundingBox) {
@@ -258,51 +296,33 @@ crawlQueue.process(async (job) => {
           await randomSleep(100, 500);
           await element.click();
           console.log("Waiting...");
-          await randomSleep(100, 500);
-          console.log(`Found drawer...`);
-          const imageUrl = await getCoverContainerImageUrl(page);
-          console.log("Found image element...");
-          if (imageUrl) {
-            const currentUrl = await page.url();
-            const urlObj = new URL(currentUrl);
-            const latitude = urlObj.searchParams.get("lat");
-            const longitude = urlObj.searchParams.get("lng");
-
-            imageUrls.push({
-              Image: imageUrl,
-              Coordinates: {
-                Lat: latitude || "",
-                Long: longitude || "",
-              }
-            });
-
-            console.log("Added image data:", imageUrl, latitude, longitude);
-          }
-          await waitForSelectorWithRetry(page, "div.mapillary-sequence-step-next", 5, 3000);
-          const nextElement = await page.$("div.mapillary-sequence-step-next");
-          console.log("Next...");
-          if (nextElement) {
-            let nextClickLimit = 5;
-            while (nextElement && nextClickLimit > 0) {
-              await nextElement.click();
-              nextClickLimit--;
-              await randomSleep(100, 500);
-            }
-            if (nextClickLimit === 0) {
-              console.log("Reached max next clicks limit.");
+          const playButtonSelector = "div.mapillary-sequence-play";
+          await page.waitForSelector(playButtonSelector, { timeout: 5000 });
+          const playButton = await page.$(playButtonSelector);
+          if (playButton) {
+            const isVisible = await playButton.isVisible();
+            if (isVisible) {
+              console.log("Clicking Play button...");
+              await playButton.click();
+            } else {
+              console.warn("Play button is not visible.");
             }
           } else {
-            console.log("No next element, waiting...");
+            console.error("Play button not found!");
+            return;
           }
+          const imageUrls = [];
+          const containerSelector = "div.mapillary-cover-background";
+          await trackImageUrls(page, containerSelector, imageUrls, 60000, 1000);
+          const newUser = new User({
+            Username: username,
+            Clusters: imageUrls,
+          });
+          await newUser.save();
         } catch (err) {
           console.error(`Error processing element:`, err.message);
         }
       }
-      const newUser = new User({
-        Username: username,
-        Clusters: imageUrls,
-      });
-      await newUser.save();
       console.log("Crawl finished !");
     } catch (error) {
       console.error(`Error crawling user ${username}:`, error.message);
@@ -313,13 +333,35 @@ crawlQueue.process(async (job) => {
       }
       release();
     }
-  }
+  };
 
   try {
     await retry(crawlData, retries, delay);
     console.log(`Successfully crawled user ${username}`);
   } catch (err) {
-    console.error(`Failed to crawl user ${username} after retries: ${err.message}`);
+    console.error(
+      `Failed to crawl user ${username} after retries: ${err.message}`
+    );
+  }
+});
+
+async function clearQueue(queue) {
+  try {
+    console.log("Clearing the queue...");
+    await queue.obliterate({ force: true });
+    console.log("Queue cleared successfully!");
+  } catch (err) {
+    console.error("Error clearing the queue:", err.message);
+  }
+}
+
+app.get("/clear-queue", async (req, res) => {
+  try {
+    await clearQueue(crawlQueue);
+    res.status(200).send("Queue cleared successfully!");
+  } catch (error) {
+    console.error("Error clearing the queue:", error.message);
+    res.status(500).json({ success: false, error: error.message });
   }
 });
 
