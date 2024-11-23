@@ -2,14 +2,13 @@ const express = require("express");
 const morgan = require("morgan");
 const path = require("path");
 const fs = require("fs");
-const puppeteer = require("puppeteer-extra");
+const puppeteer = require("puppeteer");
+const { chromium } = require("playwright");
 const StealthPlugin = require("puppeteer-extra-plugin-stealth");
 const Queue = require("bull");
 const os = require("os-utils");
-const { Semaphore } = require("async-mutex");
-
-const MAX_TABS = 10;
-const tabSemaphore = new Semaphore(MAX_TABS);
+const { Mutex } = require("async-mutex");
+const crawlMutex = new Mutex();
 
 require("dotenv").config();
 
@@ -43,222 +42,249 @@ const config = JSON.parse(
 );
 
 app.use(morgan("combined"));
-puppeteer.use(StealthPlugin());
+/* puppeteer.use(StealthPlugin()); */
 
-app.post("/start-crawl", async (req, res) => {
-  try {
-    const job = await crawlQueue.add();
-    res.status(200).json({ message: "Crawl job added to queue", jobId: job.id });
-  } catch (err) {
-    console.error("Error adding job to queue", err);
-    res.status(500).json({ message: "Failed to add job to queue" });
+app.get("/crawl", async (req, res) => {
+  let browser;
+  const url =
+    "https://www.mapillary.com/app/leaderboard/Vietnam?location=Vietnam&lat=20&lng=0&z=1.5";
+
+  if (!url) {
+    return res.status(400).json({ error: "Please provide a valid URL." });
   }
-});
-
-app.delete("/job/:id", async (req, res) => {
-  const { id } = req.params;
+  let release;
   try {
-    const job = await crawlQueue.getJob(id);
-    if (!job) {
-      return res.status(404).json({ message: "Job not found" });
+    release = await crawlMutex.acquire();
+    browser = await chromium.launch({
+      headless: false,
+      args: ["--no-sandbox", "--disable-setuid-sandbox"],
+    });
+
+    const context = await browser.newContext();
+    const page = await context.newPage();
+    await page.goto(url, { waitUntil: "domcontentloaded" });
+
+    const allTimeTabSelector = "#tab-All\\ time";
+
+    try {
+      console.log("Waiting for All time tab...");
+      await page.waitForSelector(allTimeTabSelector, {
+        visible: true,
+        timeout: 90000,
+      });
+      await randomSleep(1000, 2000);
+      console.log("Clicking All time tab...");
+      await page.click(allTimeTabSelector);
+      await page.waitForNavigation({
+        waitUntil: "networkidle2",
+        timeout: 90000,
+      });
+    } catch (error) {
+      console.error("Error interacting with All time tab:", error.message);
     }
 
-    await job.remove();
-    res.status(200).json({ message: `Job ${id} removed successfully` });
+    const data = await page.evaluate(() => {
+      const elements = Array.from(
+        document.querySelectorAll(".flex-auto.h4.truncate")
+      );
+      return elements.slice(0, 100).map((el) => el.textContent.trim());
+    });
+
+    data.forEach(async (username) => {
+      await crawlQueue.add({ username });
+    });
+
+    res.status(200).json({ success: true });
   } catch (error) {
-    console.error("Error removing job:", error);
-    res.status(500).json({ message: "Error removing job" });
+    console.error("Error during crawling:", error.message);
+    res.status(500).json({ success: false, error: error.message });
+  } finally {
+    if (browser) {
+      await browser.close();
+    }
+    if (release) {
+      release();
+    }
   }
 });
 
-let browser = null;
-
-async function getBrowserInstance() {
-  if (!browser || !browser.isConnected()) {
-    console.log("Launching a new browser instance...");
-    browser = await puppeteer.launch({
-      headless: false,
-      args: [
-        "--disable-setuid-sandbox",
-        "--no-sandbox",
-        "--single-process",
-        "--no-zygote",
-        "--enable-gpu",
-        "--window-size=1920,1080",
-        `--proxy-server=${config.proxy.http}`,
-        "--disable-web-security",
-        "--disable-features=IsolateOrigins,site-per-process",
-      ],
-      executablePath: puppeteer.executablePath(),
-      ignoreHTTPSErrors: true,
-      bypassCSP: true,
-    });
-  }
-  return browser;
-};
-
-async function getPage() {
-  await tabSemaphore.acquire();
-  const browser = await getBrowserInstance();
-  try {
-    const page = await browser.newPage();
-    page.on("close", () => tabSemaphore.release());
-    page.setDefaultTimeout(60000);
-    return page;
-  } catch (err) {
-    tabSemaphore.release();
-    throw err;
-  }
-}
-
-async function retryWrapper(taskFunc, retries = 5) {
-  let attempts = 0;
-  while (attempts < retries) {
+async function retry(fn, retries = 3, delay = 2000) {
+  let attempt = 0;
+  while (attempt < retries) {
     try {
-      return await taskFunc();
+      return await fn();
     } catch (err) {
-      attempts++;
-      console.error(`Attempt ${attempts} failed: ${err.message}`);
-      if (err.message.includes("Session closed")) {
-        console.error("Session closed. Restarting browser...");
-        if (!browser || !browser.isConnected()) {
-          await getBrowserInstance();
-        }
-        continue;
+      attempt++;
+      console.warn(`Attempt ${attempt} failed. Retrying in ${delay}ms...`);
+      if (attempt >= retries) {
+        throw new Error(`All ${retries} attempts failed: ${err.message}`);
       }
-      if (attempts >= retries) {
-        console.error("Max retry attempts reached. Throwing error.");
-        throw err;
-      }
-      const delay = attempts * 1000;
-      console.log(`Retrying in ${delay / 1000}s...`);
       await new Promise((resolve) => setTimeout(resolve, delay));
     }
   }
 };
 
-crawlQueue.process(10, async (job) => {
-  console.log("Starting crawl job...");
-  try {
-    const user = {
-      Username: "",
-      Clusters: [],
-    };
-
-    const page = await getPage();
-
-    const isOnline = await page.evaluate(() => navigator.onLine);
-    console.log("Network status:", isOnline ? "Online" : "Offline");
-
-    if (config.proxy.username && config.proxy.password) {
-      await page.authenticate({
-        username: config.proxy.username,
-        password: config.proxy.password,
-      });
-      console.log("Authenticated successfully !");
-    }
-
-    await page.setRequestInterception(true);
-    page.on("request", (request) => {
-    const resourceType = request.resourceType();
-      if (["stylesheet", "font", "media"].includes(resourceType)) {
-        console.log(`Blocking resource: ${resourceType}`);
-        request.abort();
-      } else {
-        request.continue();
-      }
-    });
-
-    const url = "https://www.mapillary.com/app/leaderboard/Vietnam?location=Vietnam&lat=20&lng=0&z=1.5";
-    await retryWrapper(() => page.goto(url, { waitUntil: "networkidle2", timeout: 90000 }));
-    
-    const allTimeTabSelector = "#tab-All\\ time";
-
+async function waitForSelectorWithRetry(page, selector, retries = 3, delay = 2000) {
+  let attempt = 0;
+  while (attempt < retries) {
     try {
-      console.log("Waiting for All time tab...");
-      await retryWrapper(() => page.waitForSelector(allTimeTabSelector, { visible: true, timeout: 90000 }));
-      await randomSleep(1000, 2000);
-      console.log("Clicking All time tab...");
-      await retryWrapper(() => page.click(allTimeTabSelector));
-      await page.waitForNavigation({ waitUntil: "networkidle2", timeout: 90000 });     
-    } catch (error) {
-      console.error("Error interacting with All time tab:", error.message);
+      await page.waitForSelector(selector, { visible: true, timeout: 30000 });
+      return;
+    } catch (err) {
+      attempt++;
+      console.warn(`Attempt ${attempt} failed for selector ${selector}. Retrying in ${delay}ms...`);
+      if (attempt >= retries) {
+        throw new Error(`All ${retries} attempts to wait for ${selector} failed.`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, delay));
     }
+  }
+};
 
-    const elements = await page.$$("div.pb1.px1.ng-star-inserted");
-    console.log(`Found ${elements.length} leaderboard elements.`);
-    if (!elements.length) {
-      throw new Error("No user elements found.");
+async function moveMouseRandomly(page, boundingBox) {
+  const x = boundingBox.x + boundingBox.width / 2;
+  const y = boundingBox.y + boundingBox.height / 2;
+  for (let i = 0; i < 5; i++) {
+    const randomX = x + Math.random() * 20 - 10;
+    const randomY = y + Math.random() * 20 - 10;
+    await page.mouse.move(randomX, randomY, { steps: 5 });
+    await randomSleep(200, 500);
+  }
+  console.log("Mouse moved over the element.");
+};
+
+crawlQueue.process(async (job) => {
+  const release = await crawlMutex.acquire();
+  const { username } = job.data;
+  console.log(`Processing crawl for user: ${username}`);
+  const userUrl = `https://www.mapillary.com/app/user/${username}`;
+  const retries = 5;
+  const delay = 3000;
+  
+  const crawlData = async () => {
+    let browser;
+    if (browser) {
+      await browser.close();
     }
+    try {
+      browser = await chromium.launch({
+        headless: false,
+        args: [
+          "--disable-setuid-sandbox",
+          "--no-sandbox",
+        ],
+      });
+  
+      const context = await browser.newContext({
+        proxy: {
+          server: config.proxy.http,
+          username: config.proxy.username,
+          password: config.proxy.password,
+        },
+      });
+      const page = await context.newPage();
 
-    await Promise.all(
-      elements.slice(0, 100).map(async (element) => {
+      await page.goto(userUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
+      await randomSleep(1000, 25000);
+      
+      await page.waitForSelector("drawer-sequence-item.ng-star-inserted", { visible: true, timeout: 60000 });
+      const elements = await page.$$("drawer-sequence-item.ng-star-inserted");
+      console.log(`Found ${elements.length} leaderboard elements.`);
+      if (!elements.length) {
+        throw new Error("No user elements found.");
+      }
+      await randomSleep(500, 1000);
+  
+      const imageUrls = [];
+      for (const element of elements) {
         try {
-          console.log(`Processing element ${index + 1}/${Math.min(elements.length, 100)}...`);
-          await retryWrapper(() => element.click());
-          console.log("Waiting for drawer elements...");
-          await page.waitForSelector("drawer-sequence-item.ng-star-inserted", { timeout: 90000 });
-          const drawers = await page.$$("drawer-sequence-item.ng-star-inserted");
-          console.log(`Found ${drawers.length} drawers.`);
-          for (const drawer of drawers) {
-            console.log(`Processing drawer...`);
-            const isVisible = await drawer.isIntersectingViewport();
-            if (!isVisible) {
-              console.log("Element not visible, skipping...");
-              continue;
+          const tmp = {
+            Image: "",
+            Coordinates: {
+              Lat: "",
+              Long: "",
+            },
+          };
+          console.log(`Processing element...`);
+          const boundingBox = await element.boundingBox();
+          const isVisible = !!boundingBox;
+          if (!isVisible) {
+            console.log("Element is not visible in viewport.");
+            await element.evaluate((el) => el.scrollIntoView({ behavior: "smooth", block: "center" }));
+          }
+          await randomSleep(500, 1000);
+          if (boundingBox) {
+            await moveMouseRandomly(page, boundingBox);
+          }
+          await randomSleep(500, 1000);
+          await element.click();
+          console.log("Waiting...");
+          await randomSleep(500, 1000);
+          console.log(`Found drawer...`);
+          await waitForSelectorWithRetry(page, "div.mapillary-cover-background", 5, 3000)
+          const imgElement = await page.$("div.mapillary-cover-background");
+          const currentUrl = await page.url();
+          const urlObj = new URL(currentUrl);
+          const latitude = urlObj.searchParams.get("lat");
+          const longitude = urlObj.searchParams.get("lng");
+          if (imgElement) {
+            const imageUrl = await page.evaluate((element) => {
+              const style = element.style.backgroundImage;
+              const match = style.match(/url\("(.*)"\)/);
+              return match ? match[1] : null;
+            }, imgElement);
+            console.log("Image url", imageUrl);
+            if (latitude && longitude && imageUrl) {
+              tmp.Image = imageUrl;
+              tmp.Coordinates.Long = longitude;
+              tmp.Coordinates.Lat = latitude;
+            } else {
+              console.warn("Skipping incomplete data:", { latitude, longitude, imageUrl });
             }
-            await retryWrapper(() => drawer.click());
-            console.log("Evaluating number of items...");
-            const numberOfItems = await page.evaluate(() => {
-              const item = document.querySelector(
-                "div.bg-gray.white.border-radius-4.flex.items-center.ng-star-inserted"
-              );
-              return item ? parseInt(item.textContent.trim(), 10) : 0;
-            });
-            console.log(`Found ${numberOfItems} items.`);
-            if (numberOfItems > 0) {
-              const currentUrl = await page.url();
-              const urlObj = new URL(currentUrl);
-              const latitude = urlObj.searchParams.get("lat");
-              const longitude = urlObj.searchParams.get("lng");
-              console.log(`Fetching image URLs for drawer...`);
-              const imageUrls = await page.evaluate(() => {
-                const images = Array.from(document.querySelectorAll("div.mapillary-cover-background"));
-                return images.map((img) =>
-                  img.style.backgroundImage.match(/url\("(.*)"\)/)?.[1]
-                ).filter(Boolean);
-              });
-              console.log(`Found ${imageUrls.length} image URLs.`);
-              if(imageUrls.length > 0) {
-                imageUrls.forEach((imageUrl) => {
-                  user.Clusters.push({
-                    Image: imageUrl,
-                    Coordinates: {
-                      Lat: latitude,
-                      Long: longitude,
-                    },
-                  });
-                });
-              }
+          }
+          imageUrls.push(tmp);
+          await page.waitForSelector("div.mapillary-sequence-step-next", { visible: true, timeout: 90000 });
+          const nextElement = await page.$("div.mapillary-sequence-step-next");
+          console.log("Next...");
+          if (nextElement) {
+            let nextClickLimit = 5;
+            while (nextElement && nextClickLimit > 0) {
+              await nextElement.click();
+              nextClickLimit--;
+              await randomSleep(1000, 2000);
             }
+            if (nextClickLimit === 0) {
+              console.log("Reached max next clicks limit.");
+            }
+          } else {
+            console.log("No next element, waiting...");
           }
         } catch (err) {
           console.error(`Error processing element:`, err.message);
         }
-      })
-    );
-    console.log("Saving user data to database...");
-    const newUser = new User(user);
-    await newUser.save();
-    console.log("Crawl job completed!");
-  } catch (err) {
-    console.error("Error during crawl job", err.message);
-  } finally {
-    if (page && !page.isClosed()) {
-      await page.close();
+      }
+      const newUser = new User({
+        Username: username,
+        Clusters: imageUrls,
+      });
+      await newUser.save();
+      console.log("Crawl finished !");
+    } catch (error) {
+      console.error(`Error crawling user ${username}:`, error.message);
+      throw error;
+    } finally {
+      if (browser) {
+        await browser.close();
+      }
+      release();
     }
-    tabSemaphore.release();
-    console.log("Tab closed.");
+  }
+
+  try {
+    await retry(crawlData, retries, delay);
+    console.log(`Successfully crawled user ${username}`);
+  } catch (err) {
+    console.error(`Failed to crawl user ${username} after retries: ${err.message}`);
   }
 });
 

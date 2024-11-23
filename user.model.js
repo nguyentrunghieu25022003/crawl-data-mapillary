@@ -4,22 +4,21 @@ const Schema = mongoose.Schema;
 const CoordinatesSchema = new Schema({
   Long: {
     type: String,
-    required: true,
+    required: true
   },
   Lat: {
     type: String,
-    required: true,
+    required: true
   },
 });
 
 const ClusterSchema = new Schema({
   Image: {
     type: String,
-    required: true,
+    required: true
   },
   Coordinates: {
     type: CoordinatesSchema,
-    required: true,
   },
 });
 
