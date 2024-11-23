@@ -155,13 +155,28 @@ async function moveMouseRandomly(page, boundingBox) {
 
 async function getCoverContainerImageUrl(page) {
   try {
-    console.log("Waiting for mapillary-dom-renderer...");
-    await waitForSelectorWithRetry(page, "div.mapillary-dom-renderer", 5, 3000);
+    console.log("Waiting for mapillary-cover-background...");
+    await page.waitForFunction(() => {
+      const element = document.querySelector("div.mapillary-cover-background");
+      if (!element) return false;
+    
+      const style = window.getComputedStyle(element);
+      return style.display !== "none" && style.visibility !== "hidden" && style.opacity !== "0";
+    }, { timeout: 60000 });
 
-    console.log("Fetching mapillary-cover-background...");
+    console.log("Found mapillary-cover-background. Waiting for image to load...");
+    await page.waitForFunction(() => {
+      const element = document.querySelector("div.mapillary-cover-background");
+      if (!element) return false;
+
+      const style = window.getComputedStyle(element);
+      return style.backgroundImage && style.backgroundImage !== "none";
+    }, { timeout: 60000 });
+
+    console.log("Image loaded. Extracting background image URL...");
+
     const backgroundElement = await page.$("div.mapillary-cover-background");
     if (backgroundElement) {
-      console.log("Found mapillary-cover-background, extracting style...");
       const styleAttribute = await backgroundElement.evaluate((el) => el.style.backgroundImage);
       const match = styleAttribute.match(/url\("(.*)"\)/);
       if (match && match[1]) {
@@ -199,12 +214,9 @@ crawlQueue.process(async (job) => {
         args: [
           "--disable-setuid-sandbox",
           "--no-sandbox",
-          "--disable-gpu",
-          "--disable-dev-shm-usage",
-          "--no-zygote",
           "--disable-software-rasterizer",
-          `--proxy-server=${config.proxy.http}`,
           "--disable-blink-features=AutomationControlled"
+          `--proxy-server=${config.proxy.http}`,
         ],
       });
   
@@ -219,7 +231,7 @@ crawlQueue.process(async (job) => {
       });
       const page = await context.newPage();
 
-      await page.goto(userUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
+      await page.goto(userUrl, { waitUntil: "networkidle", timeout: 120000 });
       await randomSleep(1000, 20000);
       
       await waitForSelectorWithRetry(page, "drawer-sequence-item.ng-star-inserted", 5, 3000);
@@ -228,8 +240,7 @@ crawlQueue.process(async (job) => {
       if (!elements.length) {
         throw new Error("No user elements found.");
       }
-      await randomSleep(200, 600);
-      await page.waitForSelector("window", { visible: true, timeout: 6000 });
+      await randomSleep(200, 500);
       const imageUrls = [];
       for (const element of elements) {
         try {
