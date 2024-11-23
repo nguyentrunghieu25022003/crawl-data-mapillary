@@ -75,8 +75,8 @@ app.get("/crawl", async (req, res) => {
       await randomSleep(1000, 2000);
       console.log("Clicking All time tab...");
       await page.click(allTimeTabSelector);
-      await page.waitForNavigation({
-        waitUntil: "networkidle2",
+      await page.waitForSelector("div.pb1.px1.ng-star-inserted",{
+        waitUntil: "domcontentloaded",
         timeout: 90000,
       });
     } catch (error) {
@@ -108,7 +108,7 @@ app.get("/crawl", async (req, res) => {
   }
 });
 
-async function retry(fn, retries = 3, delay = 2000) {
+async function retry(fn, retries = 4, delay = 2000) {
   let attempt = 0;
   while (attempt < retries) {
     try {
@@ -124,7 +124,7 @@ async function retry(fn, retries = 3, delay = 2000) {
   }
 };
 
-async function waitForSelectorWithRetry(page, selector, retries = 3, delay = 2000) {
+async function waitForSelectorWithRetry(page, selector, retries = 4, delay = 2000) {
   let attempt = 0;
   while (attempt < retries) {
     try {
@@ -153,6 +153,33 @@ async function moveMouseRandomly(page, boundingBox) {
   console.log("Mouse moved over the element.");
 };
 
+async function getCoverContainerImageUrl(page) {
+  try {
+    console.log("Waiting for mapillary-dom-renderer...");
+    await waitForSelectorWithRetry(page, "div.mapillary-dom-renderer", 5, 3000);
+
+    console.log("Fetching mapillary-cover-background...");
+    const backgroundElement = await page.$("div.mapillary-cover-background");
+    if (backgroundElement) {
+      console.log("Found mapillary-cover-background, extracting style...");
+      const styleAttribute = await backgroundElement.evaluate((el) => el.style.backgroundImage);
+      const match = styleAttribute.match(/url\("(.*)"\)/);
+      if (match && match[1]) {
+        const imageUrl = match[1];
+        console.log("Extracted Image URL:", imageUrl);
+        return imageUrl;
+      } else {
+        console.warn("No valid background-image URL found.");
+      }
+    } else {
+      console.warn("mapillary-cover-background not found.");
+    }
+  } catch (err) {
+    console.error("Error fetching cover container image URL:", err.message);
+  }
+  return null;
+};
+
 crawlQueue.process(async (job) => {
   const release = await crawlMutex.acquire();
   const { username } = job.data;
@@ -172,39 +199,40 @@ crawlQueue.process(async (job) => {
         args: [
           "--disable-setuid-sandbox",
           "--no-sandbox",
+          "--disable-gpu",
+          "--disable-dev-shm-usage",
+          "--no-zygote",
+          "--disable-software-rasterizer",
+          `--proxy-server=${config.proxy.http}`,
+          "--disable-blink-features=AutomationControlled"
         ],
       });
   
       const context = await browser.newContext({
+        userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
         proxy: {
           server: config.proxy.http,
           username: config.proxy.username,
           password: config.proxy.password,
         },
+        bypassCSP: true,
       });
       const page = await context.newPage();
 
       await page.goto(userUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
-      await randomSleep(1000, 25000);
+      await randomSleep(1000, 20000);
       
-      await page.waitForSelector("drawer-sequence-item.ng-star-inserted", { visible: true, timeout: 60000 });
+      await waitForSelectorWithRetry(page, "drawer-sequence-item.ng-star-inserted", 5, 3000);
       const elements = await page.$$("drawer-sequence-item.ng-star-inserted");
       console.log(`Found ${elements.length} leaderboard elements.`);
       if (!elements.length) {
         throw new Error("No user elements found.");
       }
-      await randomSleep(500, 1000);
-  
+      await randomSleep(200, 600);
+      await page.waitForSelector("window", { visible: true, timeout: 6000 });
       const imageUrls = [];
       for (const element of elements) {
         try {
-          const tmp = {
-            Image: "",
-            Coordinates: {
-              Lat: "",
-              Long: "",
-            },
-          };
           console.log(`Processing element...`);
           const boundingBox = await element.boundingBox();
           const isVisible = !!boundingBox;
@@ -212,38 +240,34 @@ crawlQueue.process(async (job) => {
             console.log("Element is not visible in viewport.");
             await element.evaluate((el) => el.scrollIntoView({ behavior: "smooth", block: "center" }));
           }
-          await randomSleep(500, 1000);
+          await randomSleep(100, 500);
           if (boundingBox) {
             await moveMouseRandomly(page, boundingBox);
           }
-          await randomSleep(500, 1000);
+          await randomSleep(100, 500);
           await element.click();
           console.log("Waiting...");
-          await randomSleep(500, 1000);
+          await randomSleep(100, 500);
           console.log(`Found drawer...`);
-          await waitForSelectorWithRetry(page, "div.mapillary-cover-background", 5, 3000)
-          const imgElement = await page.$("div.mapillary-cover-background");
-          const currentUrl = await page.url();
-          const urlObj = new URL(currentUrl);
-          const latitude = urlObj.searchParams.get("lat");
-          const longitude = urlObj.searchParams.get("lng");
-          if (imgElement) {
-            const imageUrl = await page.evaluate((element) => {
-              const style = element.style.backgroundImage;
-              const match = style.match(/url\("(.*)"\)/);
-              return match ? match[1] : null;
-            }, imgElement);
-            console.log("Image url", imageUrl);
-            if (latitude && longitude && imageUrl) {
-              tmp.Image = imageUrl;
-              tmp.Coordinates.Long = longitude;
-              tmp.Coordinates.Lat = latitude;
-            } else {
-              console.warn("Skipping incomplete data:", { latitude, longitude, imageUrl });
-            }
+          const imageUrl = await getCoverContainerImageUrl(page);
+          console.log("Found image element...");
+          if (imageUrl) {
+            const currentUrl = await page.url();
+            const urlObj = new URL(currentUrl);
+            const latitude = urlObj.searchParams.get("lat");
+            const longitude = urlObj.searchParams.get("lng");
+
+            imageUrls.push({
+              Image: imageUrl,
+              Coordinates: {
+                Lat: latitude || "",
+                Long: longitude || "",
+              }
+            });
+
+            console.log("Added image data:", imageUrl, latitude, longitude);
           }
-          imageUrls.push(tmp);
-          await page.waitForSelector("div.mapillary-sequence-step-next", { visible: true, timeout: 90000 });
+          await waitForSelectorWithRetry(page, "div.mapillary-sequence-step-next", 5, 3000);
           const nextElement = await page.$("div.mapillary-sequence-step-next");
           console.log("Next...");
           if (nextElement) {
@@ -251,7 +275,7 @@ crawlQueue.process(async (job) => {
             while (nextElement && nextClickLimit > 0) {
               await nextElement.click();
               nextClickLimit--;
-              await randomSleep(1000, 2000);
+              await randomSleep(100, 500);
             }
             if (nextClickLimit === 0) {
               console.log("Reached max next clicks limit.");
