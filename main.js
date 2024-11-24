@@ -54,7 +54,7 @@ app.get("/crawl", async (req, res) => {
   try {
     release = await crawlMutex.acquire();
     browser = await chromium.launch({
-      headless: false,
+      headless: true,
       args: ["--no-sandbox", "--disable-setuid-sandbox"],
     });
 
@@ -158,35 +158,31 @@ async function moveMouseRandomly(page, boundingBox) {
     await randomSleep(200, 500);
   }
   console.log("Mouse moved over the element.");
-}
+};
 
-async function waitForImageLoaded(page, containerSelector, timeout = 10000) {
-  try {
-    console.log("Waiting for the image to load...");
-
-    await page.waitForFunction(
-      (selector) => {
-        const element = document.querySelector(selector);
-        if (!element) return false;
-
-        const style = window.getComputedStyle(element);
-        return (
-          style.backgroundImage !== "none" &&
-          style.backgroundImage.includes("url(")
-        );
-      },
-      { timeout },
-      containerSelector
-    );
-
-    console.log("Image loaded successfully.");
-    return true;
-  } catch (error) {
-    console.warn("Image loading timeout or failed.");
-    return false;
+async function closeModalIfVisible(page, modalCloseSelector, retries = 2, delay = 2000) {
+  await waitForSelectorWithRetry(page, modalCloseSelector, 2, 2000);
+  for (let i = 0; i < retries; i++) {
+    try {
+      const modalIsVisible = await page.isVisible(modalCloseSelector);
+      if (modalIsVisible) {
+        console.log("Modal found. Closing it...");
+        await page.click(modalCloseSelector);
+        await page.waitForTimeout(1000);
+        console.log("Modal closed successfully.");
+        return;
+      } else {
+        break;
+      }
+    } catch (error) {
+      console.log(`Attempt ${i + 1} to close modal failed. Retrying...`);
+      await page.waitForTimeout(delay);
+    }
   }
-}
-crawlQueue.process(async (job) => {
+  console.log("No modal found or failed to close after retries.");
+};
+
+crawlQueue.process(2, async (job) => {
   const release = await crawlMutex.acquire();
   const { username } = job.data;
   console.log(`Processing crawl for user: ${username}`);
@@ -196,12 +192,9 @@ crawlQueue.process(async (job) => {
 
   const crawlData = async () => {
     let browser;
-    if (browser) {
-      await browser.close();
-    }
     try {
       browser = await chromium.launch({
-        headless: false,
+        headless: true,
         args: [
           "--disable-setuid-sandbox",
           "--no-sandbox",
@@ -211,14 +204,36 @@ crawlQueue.process(async (job) => {
       });
 
       const context = await browser.newContext({
-        userAgent:
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+        userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
         bypassCSP: true,
       });
       const page = await context.newPage();
+      await page.setViewportSize({ width: 675, height: 667 });
 
-      await page.goto(userUrl, { waitUntil: "networkidle", timeout: 120000 });
-      await randomSleep(1000, 20000);
+      let latitude = "Unknown";
+      let longitude = "Unknown";
+
+      const imageUrlsSet = new Set();
+      const imageDataArray = [];
+
+      page.on("response", async (response) => {
+        if (response.request().resourceType() === "image" && response.url().includes("blob")) {
+          console.log("Image URL: ", response.url());
+          if (!imageUrlsSet.has(response.url())) {
+            imageUrlsSet.add(response.url());
+            imageDataArray.push({
+              Image: response.url(),
+              Coordinates: {
+                Long: longitude,
+                Lat: latitude,
+              }
+            });
+          }
+        }
+      });
+
+      await page.goto(userUrl, { waitUntil: "networkidle", timeout: 90000 });
+      await randomSleep(5000, 10000);
 
       await waitForSelectorWithRetry(
         page,
@@ -232,6 +247,7 @@ crawlQueue.process(async (job) => {
         throw new Error("No user elements found.");
       }
       await randomSleep(100, 500);
+      const modalCloseSelector = "div#close_dialog_box";
       for (const element of elements) {
         try {
           console.log(`Processing element...`);
@@ -247,97 +263,47 @@ crawlQueue.process(async (job) => {
           if (boundingBox) {
             await moveMouseRandomly(page, boundingBox);
           }
-          await randomSleep(100, 500);
+          await randomSleep(1000, 2000);
           await element.click();
+          await randomSleep(100, 500);
           console.log("Waiting...");
-          const imageUrls = [];
-          const maxRetries = 5;
-          let retryCount = maxRetries;
-
-          while (retryCount > 0) {
+          await randomSleep(100, 500);
+          const currentUrl = await page.url();
+          const urlObj = new URL(currentUrl);
+          latitude = urlObj.searchParams.get("lat");
+          longitude = urlObj.searchParams.get("lng");
+          console.log(`Current URL: ${currentUrl}, Latitude: ${latitude}, Longitude: ${longitude}`);
+          let nextClickCount = 0;
+          const maxNextClicks = 20; 
+          while (nextClickCount < maxNextClicks) {
             try {
               await randomSleep(100, 500);
-
-              const imageElementSelector = "div.mapillary-cover-background";
-              const newUrl = await page.evaluate((selector) => {
-                const element = document.querySelector(selector);
-                if (element) {
-                  const style = window.getComputedStyle(element);
-                  const backgroundImage = style.backgroundImage;
-                  const urlMatch = backgroundImage.match(/url\("(.*?)"\)/);
-                  return urlMatch ? urlMatch[1] : null;
-                }
-                return null;
-              }, imageElementSelector);
-
-              if (!newUrl) {
-                console.log(
-                  "No image URL found for the current step. Retrying..."
-                );
-                retryCount--;
-                continue;
-              }
-
-              const currentUrl = await page.url();
-              const urlObj = new URL(currentUrl);
-              const latitude = urlObj.searchParams.get("lat");
-              const longitude = urlObj.searchParams.get("lng");
-
-              imageUrls.push({
-                Image: newUrl,
-                Coordinates: {
-                  Lat: latitude || "Unknown",
-                  Long: longitude || "Unknown",
-                },
-              });
-
-              console.log(
-                `Image captured: ${newUrl}, Coordinates: [${latitude}, ${longitude}]`
-              );
-              retryCount = maxRetries;
-
-              const isNextButtonInactive = await page.evaluate(
-                (inactiveSelector) => {
-                  const button = document.querySelector(inactiveSelector);
-                  return button !== null;
-                },
-                ".mapillary-sequence-step-next-inactive"
-              );
+              const isNextButtonInactive = await page.evaluate((inactiveSelector) => {
+                const button = document.querySelector(inactiveSelector);
+                return button !== null;
+              }, ".mapillary-sequence-step-next-inactive");
 
               if (isNextButtonInactive) {
-                console.log(
-                  "'Next' button is inactive. No more images to process."
-                );
+                console.log("'Next' button is inactive. No more images to process.");
                 break;
               }
 
               console.log("Clicking 'Next' button...");
               await page.waitForSelector(".mapillary-sequence-step-next", {
                 visible: true,
-                timeout: 20000,
+                timeout: 10000,
               });
               await page.click(".mapillary-sequence-step-next");
-              await page.waitForTimeout(5000);
+              await page.waitForTimeout(2000);
+              nextClickCount++;
             } catch (err) {
-              console.error(
-                "Error while processing 'Next' button:",
-                err.message
-              );
-              retryCount--; // Giảm số lần retry khi gặp lỗi
-              if (retryCount <= 0) {
-                console.log(
-                  "Maximum retry attempts reached. Stopping process."
-                );
-                break; // Dừng nếu hết số lần retry
-              }
-              console.log(
-                `Retrying... (${maxRetries - retryCount}/${maxRetries})`
-              );
+              console.error("Error while processing 'Next' button:", err.message);
+              break;
             }
           }
           const newUser = new User({
             Username: username,
-            Clusters: imageUrls,
+            Clusters: imageDataArray,
             CreatedAt: new Date(),
           });
           await newUser.save();
