@@ -44,7 +44,8 @@ app.use(morgan("combined"));
 
 app.get("/crawl", async (req, res) => {
   let browser;
-  const url = "https://www.mapillary.com/app/leaderboard/Vietnam?location=Vietnam&lat=20&lng=0&z=1.5";
+  const url =
+    "https://www.mapillary.com/app/leaderboard/Vietnam?location=Vietnam&lat=20&lng=0&z=1.5";
 
   if (!url) {
     return res.status(400).json({ error: "Please provide a valid URL." });
@@ -119,9 +120,14 @@ async function retry(fn, retries = 4, delay = 2000) {
       await new Promise((resolve) => setTimeout(resolve, delay));
     }
   }
-};
+}
 
-async function waitForSelectorWithRetry(page, selector, retries = 4, delay = 2000) {
+async function waitForSelectorWithRetry(
+  page,
+  selector,
+  retries = 4,
+  delay = 2000
+) {
   let attempt = 0;
   while (attempt < retries) {
     try {
@@ -140,7 +146,7 @@ async function waitForSelectorWithRetry(page, selector, retries = 4, delay = 200
       await new Promise((resolve) => setTimeout(resolve, delay));
     }
   }
-};
+}
 
 async function moveMouseRandomly(page, boundingBox) {
   const x = boundingBox.x + boundingBox.width / 2;
@@ -152,7 +158,7 @@ async function moveMouseRandomly(page, boundingBox) {
     await randomSleep(200, 500);
   }
   console.log("Mouse moved over the element.");
-};
+}
 
 async function waitForImageLoaded(page, containerSelector, timeout = 10000) {
   try {
@@ -179,117 +185,7 @@ async function waitForImageLoaded(page, containerSelector, timeout = 10000) {
     console.warn("Image loading timeout or failed.");
     return false;
   }
-};
-
-async function trackImageUrls(page, containerSelector, imageUrls, maxDuration = 60000, maxImages = 500) {
-  console.log("Starting to track image URLs...");
-
-  const startTime = Date.now();
-  let idleTime = 0;
-
-  await page.evaluate((selector) => {
-    const targetNode = document.querySelector(selector);
-    if (!targetNode) {
-      console.warn("Container not found for tracking!");
-      return;
-    }
-
-    window.collectedImageUrls = window.collectedImageUrls || new Set();
-
-    const observer = new MutationObserver((mutationsList) => {
-      for (const mutation of mutationsList) {
-        if (mutation.type === "attributes" && mutation.attributeName === "style") {
-          const backgroundImage = window.getComputedStyle(mutation.target).backgroundImage;
-          const match = backgroundImage.match(/url\("(.*)"\)/);
-          if (match && match[1]) {
-            window.collectedImageUrls.add(match[1]); // Add to Set for uniqueness
-            console.log("New Image URL detected:", match[1]);
-          }
-        }
-      }
-    });
-
-    observer.observe(targetNode, { attributes: true });
-    console.log("Observer attached to:", selector);
-  }, containerSelector);
-
-  while (Date.now() - startTime < maxDuration) {
-    const urls = await page.evaluate(() => Array.from(window.collectedImageUrls || []));
-    const newUrls = urls.filter(
-      (item) => !imageUrls.some((existing) => existing.Image === item)
-    );
-
-    if (newUrls.length > 0) {
-      for (const newUrl of newUrls) {
-        const currentUrl = await page.url();
-        const urlObj = new URL(currentUrl);
-        const latitude = urlObj.searchParams.get("lat");
-        const longitude = urlObj.searchParams.get("lng");
-
-        imageUrls.push({
-          Image: newUrl,
-          Coordinates: {
-            Lat: latitude || "Unknown",
-            Long: longitude || "Unknown",
-          },
-        });
-
-        console.log(`New Image with Coordinates: ${newUrl}, Lat: ${latitude}, Lng: ${longitude}`);
-      }
-
-      const imageLoaded = await waitForImageLoaded(page, containerSelector, 5000);
-      if (!imageLoaded) {
-        console.warn("Next image did not load. Stopping tracking.");
-        await page.waitForTimeout(5000);
-        continue;
-      }
-
-      idleTime = 0;
-
-      if (imageUrls.length >= maxImages) {
-        console.log(`Reached the maximum image limit (${maxImages}). Stopping.`);
-        break;
-      }
-    } else {
-      idleTime += 1000;
-      if (idleTime >= 10000) {
-        console.log("No new images detected for 10 seconds. Stopping.");
-        break;
-      }
-    }
-    await page.waitForTimeout(1000);
-  }
-
-  console.log("Finished tracking image URLs.");
-};
-
-async function retryClick(page, selector, retries = 3, delay = 5000) {
-  for (let attempt = 1; attempt <= retries; attempt++) {
-    try {
-      console.log(`Attempt ${attempt} to click ${selector}`);
-      const playButton = await page.$(selector);
-      if (playButton) {
-        const isVisible = await playButton.isVisible();
-        if (isVisible) {
-          console.log("Clicking Play button...");
-          await playButton.click();
-          return true;
-        }
-      }
-      throw new Error(`Play button not visible on attempt ${attempt}`);
-    } catch (err) {
-      console.warn(err.message);
-      if (attempt < retries) {
-        console.log(`Retrying in ${delay / 1000} seconds...`);
-        await page.waitForTimeout(delay);
-      } else {
-        console.error("Exhausted all retries for clicking play button.");
-        return false;
-      }
-    }
-  }
-};
-
+}
 crawlQueue.process(async (job) => {
   const release = await crawlMutex.acquire();
   const { username } = job.data;
@@ -315,7 +211,8 @@ crawlQueue.process(async (job) => {
       });
 
       const context = await browser.newContext({
-        userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+        userAgent:
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
         bypassCSP: true,
       });
       const page = await context.newPage();
@@ -323,7 +220,12 @@ crawlQueue.process(async (job) => {
       await page.goto(userUrl, { waitUntil: "networkidle", timeout: 120000 });
       await randomSleep(1000, 20000);
 
-      await waitForSelectorWithRetry(page, "drawer-sequence-item.ng-star-inserted", 5, 3000);
+      await waitForSelectorWithRetry(
+        page,
+        "drawer-sequence-item.ng-star-inserted",
+        5,
+        3000
+      );
       const elements = await page.$$("drawer-sequence-item.ng-star-inserted");
       console.log(`Found ${elements.length} leaderboard elements.`);
       if (!elements.length) {
@@ -348,32 +250,95 @@ crawlQueue.process(async (job) => {
           await randomSleep(100, 500);
           await element.click();
           console.log("Waiting...");
-          const playButtonSelector = "div.mapillary-sequence-play";
-          const containerSelector = "div.mapillary-cover-background";
-          await page.waitForSelector(playButtonSelector, { timeout: 15000 });
-          try {      
-            const clicked = await retryClick(page, playButtonSelector, 3, 5000);
-            if (!clicked) {
-              console.warn("Could not click the play button. Skipping this sequence.");
-              continue;
-            }
-          
-            const imageLoaded = await waitForImageLoaded(page, containerSelector, 10000);
-            if (!imageLoaded) {
-              console.warn("First image did not load. Skipping this sequence.");
-              await randomSleep(5000, 15000);
-            }
-          } catch (err) {
-            console.error("Error during play button interaction:", err.message);
-          }
-          await randomSleep(1000, 2000);
           const imageUrls = [];
-          await trackImageUrls(page, containerSelector, imageUrls, 120000, 2000);
-          randomSleep(5000, 1000);
+          const maxRetries = 5;
+          let retryCount = maxRetries;
+
+          while (retryCount > 0) {
+            try {
+              await randomSleep(100, 500);
+
+              const imageElementSelector = "div.mapillary-cover-background";
+              const newUrl = await page.evaluate((selector) => {
+                const element = document.querySelector(selector);
+                if (element) {
+                  const style = window.getComputedStyle(element);
+                  const backgroundImage = style.backgroundImage;
+                  const urlMatch = backgroundImage.match(/url\("(.*?)"\)/);
+                  return urlMatch ? urlMatch[1] : null;
+                }
+                return null;
+              }, imageElementSelector);
+
+              if (!newUrl) {
+                console.log(
+                  "No image URL found for the current step. Retrying..."
+                );
+                retryCount--;
+                continue;
+              }
+
+              const currentUrl = await page.url();
+              const urlObj = new URL(currentUrl);
+              const latitude = urlObj.searchParams.get("lat");
+              const longitude = urlObj.searchParams.get("lng");
+
+              imageUrls.push({
+                Image: newUrl,
+                Coordinates: {
+                  Lat: latitude || "Unknown",
+                  Long: longitude || "Unknown",
+                },
+              });
+
+              console.log(
+                `Image captured: ${newUrl}, Coordinates: [${latitude}, ${longitude}]`
+              );
+              retryCount = maxRetries;
+
+              const isNextButtonInactive = await page.evaluate(
+                (inactiveSelector) => {
+                  const button = document.querySelector(inactiveSelector);
+                  return button !== null;
+                },
+                ".mapillary-sequence-step-next-inactive"
+              );
+
+              if (isNextButtonInactive) {
+                console.log(
+                  "'Next' button is inactive. No more images to process."
+                );
+                break;
+              }
+
+              console.log("Clicking 'Next' button...");
+              await page.waitForSelector(".mapillary-sequence-step-next", {
+                visible: true,
+                timeout: 20000,
+              });
+              await page.click(".mapillary-sequence-step-next");
+              await page.waitForTimeout(5000);
+            } catch (err) {
+              console.error(
+                "Error while processing 'Next' button:",
+                err.message
+              );
+              retryCount--; // Giảm số lần retry khi gặp lỗi
+              if (retryCount <= 0) {
+                console.log(
+                  "Maximum retry attempts reached. Stopping process."
+                );
+                break; // Dừng nếu hết số lần retry
+              }
+              console.log(
+                `Retrying... (${maxRetries - retryCount}/${maxRetries})`
+              );
+            }
+          }
           const newUser = new User({
             Username: username,
             Clusters: imageUrls,
-            CreatedAt: new Date()
+            CreatedAt: new Date(),
           });
           await newUser.save();
         } catch (err) {
