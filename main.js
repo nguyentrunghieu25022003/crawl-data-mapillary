@@ -154,6 +154,33 @@ async function moveMouseRandomly(page, boundingBox) {
   console.log("Mouse moved over the element.");
 };
 
+async function waitForImageLoaded(page, containerSelector, timeout = 10000) {
+  try {
+    console.log("Waiting for the image to load...");
+
+    await page.waitForFunction(
+      (selector) => {
+        const element = document.querySelector(selector);
+        if (!element) return false;
+
+        const style = window.getComputedStyle(element);
+        return (
+          style.backgroundImage !== "none" &&
+          style.backgroundImage.includes("url(")
+        );
+      },
+      { timeout },
+      containerSelector
+    );
+
+    console.log("Image loaded successfully.");
+    return true;
+  } catch (error) {
+    console.warn("Image loading timeout or failed.");
+    return false;
+  }
+};
+
 async function trackImageUrls(page, containerSelector, imageUrls, maxDuration = 60000, maxImages = 500) {
   console.log("Starting to track image URLs...");
 
@@ -213,6 +240,12 @@ async function trackImageUrls(page, containerSelector, imageUrls, maxDuration = 
         console.log(`New Image with Coordinates: ${newUrl.image}, Lat: ${latitude}, Lng: ${longitude}`);
       }
 
+      const imageLoaded = await waitForImageLoaded(page, containerSelector, 10000);
+      if (!imageLoaded) {
+        console.warn("Next image did not load. Stopping tracking.");
+        break;
+      }
+
       idleTime = 0;
 
       if (imageUrls.length >= maxImages) {
@@ -232,7 +265,7 @@ async function trackImageUrls(page, containerSelector, imageUrls, maxDuration = 
   console.log("Finished tracking image URLs.");
 };
 
-crawlQueue.process(async (job) => {
+crawlQueue.process(5, async (job) => {
   const release = await crawlMutex.acquire();
   const { username } = job.data;
   console.log(`Processing crawl for user: ${username}`);
@@ -297,13 +330,19 @@ crawlQueue.process(async (job) => {
           await element.click();
           console.log("Waiting...");
           const playButtonSelector = "div.mapillary-sequence-play";
-          await page.waitForSelector(playButtonSelector, { timeout: 5000 });
+          const containerSelector = "div.mapillary-cover-background";
+          await page.waitForSelector(playButtonSelector, { timeout: 35000 });
           const playButton = await page.$(playButtonSelector);
           if (playButton) {
             const isVisible = await playButton.isVisible();
             if (isVisible) {
               console.log("Clicking Play button...");
               await playButton.click();
+              const imageLoaded = await waitForImageLoaded(page, containerSelector, 10000);
+              if (!imageLoaded) {
+                console.warn("First image did not load. Skipping this sequence.");
+                return;
+              }
             } else {
               console.warn("Play button is not visible.");
             }
@@ -312,7 +351,6 @@ crawlQueue.process(async (job) => {
             return;
           }
           const imageUrls = [];
-          const containerSelector = "div.mapillary-cover-background";
           await trackImageUrls(page, containerSelector, imageUrls, 60000, 1000);
           const newUser = new User({
             Username: username,
