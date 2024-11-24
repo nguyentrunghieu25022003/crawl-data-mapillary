@@ -194,7 +194,7 @@ async function trackImageUrls(page, containerSelector, imageUrls, maxDuration = 
       return;
     }
 
-    window.collectedImageUrls = window.collectedImageUrls || [];
+    window.collectedImageUrls = window.collectedImageUrls || new Set();
 
     const observer = new MutationObserver((mutationsList) => {
       for (const mutation of mutationsList) {
@@ -202,11 +202,8 @@ async function trackImageUrls(page, containerSelector, imageUrls, maxDuration = 
           const backgroundImage = window.getComputedStyle(mutation.target).backgroundImage;
           const match = backgroundImage.match(/url\("(.*)"\)/);
           if (match && match[1]) {
-            const imageUrl = match[1];
-            if (!window.collectedImageUrls.some((item) => item.image === imageUrl)) {
-              window.collectedImageUrls.push({ image: imageUrl });
-              console.log("New Image URL detected:", imageUrl);
-            }
+            window.collectedImageUrls.add(match[1]); // Add to Set for uniqueness
+            console.log("New Image URL detected:", match[1]);
           }
         }
       }
@@ -217,9 +214,9 @@ async function trackImageUrls(page, containerSelector, imageUrls, maxDuration = 
   }, containerSelector);
 
   while (Date.now() - startTime < maxDuration) {
-    const urls = await page.evaluate(() => window.collectedImageUrls || []);
+    const urls = await page.evaluate(() => Array.from(window.collectedImageUrls || []));
     const newUrls = urls.filter(
-      (item) => !imageUrls.some((existing) => existing.image === item.image)
+      (item) => !imageUrls.some((existing) => existing.Image === item)
     );
 
     if (newUrls.length > 0) {
@@ -230,20 +227,21 @@ async function trackImageUrls(page, containerSelector, imageUrls, maxDuration = 
         const longitude = urlObj.searchParams.get("lng");
 
         imageUrls.push({
-          Image: newUrl.image,
+          Image: newUrl,
           Coordinates: {
             Lat: latitude || "Unknown",
             Long: longitude || "Unknown",
           },
         });
 
-        console.log(`New Image with Coordinates: ${newUrl.image}, Lat: ${latitude}, Lng: ${longitude}`);
+        console.log(`New Image with Coordinates: ${newUrl}, Lat: ${latitude}, Lng: ${longitude}`);
       }
 
-      const imageLoaded = await waitForImageLoaded(page, containerSelector, 10000);
+      const imageLoaded = await waitForImageLoaded(page, containerSelector, 5000);
       if (!imageLoaded) {
         console.warn("Next image did not load. Stopping tracking.");
-        break;
+        await page.waitForTimeout(5000);
+        continue;
       }
 
       idleTime = 0;
@@ -265,7 +263,34 @@ async function trackImageUrls(page, containerSelector, imageUrls, maxDuration = 
   console.log("Finished tracking image URLs.");
 };
 
-crawlQueue.process(5, async (job) => {
+async function retryClick(page, selector, retries = 3, delay = 5000) {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      console.log(`Attempt ${attempt} to click ${selector}`);
+      const playButton = await page.$(selector);
+      if (playButton) {
+        const isVisible = await playButton.isVisible();
+        if (isVisible) {
+          console.log("Clicking Play button...");
+          await playButton.click();
+          return true;
+        }
+      }
+      throw new Error(`Play button not visible on attempt ${attempt}`);
+    } catch (err) {
+      console.warn(err.message);
+      if (attempt < retries) {
+        console.log(`Retrying in ${delay / 1000} seconds...`);
+        await page.waitForTimeout(delay);
+      } else {
+        console.error("Exhausted all retries for clicking play button.");
+        return false;
+      }
+    }
+  }
+};
+
+crawlQueue.process(async (job) => {
   const release = await crawlMutex.acquire();
   const { username } = job.data;
   console.log(`Processing crawl for user: ${username}`);
@@ -286,17 +311,11 @@ crawlQueue.process(5, async (job) => {
           "--no-sandbox",
           "--disable-software-rasterizer",
           "--disable-blink-features=AutomationControlled",
-          `--proxy-server=${config.proxy.http}`,
         ],
       });
 
       const context = await browser.newContext({
         userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-        proxy: {
-          server: config.proxy.http,
-          username: config.proxy.username,
-          password: config.proxy.password,
-        },
         bypassCSP: true,
       });
       const page = await context.newPage();
@@ -331,30 +350,30 @@ crawlQueue.process(5, async (job) => {
           console.log("Waiting...");
           const playButtonSelector = "div.mapillary-sequence-play";
           const containerSelector = "div.mapillary-cover-background";
-          await page.waitForSelector(playButtonSelector, { timeout: 35000 });
-          const playButton = await page.$(playButtonSelector);
-          if (playButton) {
-            const isVisible = await playButton.isVisible();
-            if (isVisible) {
-              console.log("Clicking Play button...");
-              await playButton.click();
-              const imageLoaded = await waitForImageLoaded(page, containerSelector, 10000);
-              if (!imageLoaded) {
-                console.warn("First image did not load. Skipping this sequence.");
-                return;
-              }
-            } else {
-              console.warn("Play button is not visible.");
+          await page.waitForSelector(playButtonSelector, { timeout: 15000 });
+          try {      
+            const clicked = await retryClick(page, playButtonSelector, 3, 5000);
+            if (!clicked) {
+              console.warn("Could not click the play button. Skipping this sequence.");
+              continue;
             }
-          } else {
-            console.error("Play button not found!");
-            return;
+          
+            const imageLoaded = await waitForImageLoaded(page, containerSelector, 10000);
+            if (!imageLoaded) {
+              console.warn("First image did not load. Skipping this sequence.");
+              await randomSleep(5000, 15000);
+            }
+          } catch (err) {
+            console.error("Error during play button interaction:", err.message);
           }
+          await randomSleep(1000, 2000);
           const imageUrls = [];
-          await trackImageUrls(page, containerSelector, imageUrls, 60000, 1000);
+          await trackImageUrls(page, containerSelector, imageUrls, 120000, 2000);
+          randomSleep(5000, 1000);
           const newUser = new User({
             Username: username,
             Clusters: imageUrls,
+            CreatedAt: new Date()
           });
           await newUser.save();
         } catch (err) {
