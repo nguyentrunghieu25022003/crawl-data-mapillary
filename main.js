@@ -160,24 +160,27 @@ async function moveMouseRandomly(page, boundingBox) {
   console.log("Mouse moved over the element.");
 };
 
-async function closeModalIfVisible(page, modalCloseSelector, retries = 2, delay = 2000) {
-  await waitForSelectorWithRetry(page, modalCloseSelector, 2, 2000);
+async function closeModalIfVisible(page, modalCloseSelector, blockingSelector, retries = 5, delay = 2000) {
   for (let i = 0; i < retries; i++) {
     try {
-      const modalIsVisible = await page.isVisible(modalCloseSelector);
-      if (modalIsVisible) {
-        console.log("Modal found. Closing it...");
+      const isBlockingElementPresent = await page.$(blockingSelector);
+      if (!isBlockingElementPresent) {
+        console.log(`Blocking element (${blockingSelector}) not found...`);
+        
+        await page.waitForSelector(modalCloseSelector, { visible: true, timeout: 10000 });
+        console.log("Modal found. Attempting to close...");
+
         await page.click(modalCloseSelector);
         await page.waitForTimeout(1000);
         console.log("Modal closed successfully.");
         return;
       } else {
-        break;
+        console.log(`Blocking element (${blockingSelector})...`);
       }
     } catch (error) {
-      console.log(`Attempt ${i + 1} to close modal failed. Retrying...`);
-      await page.waitForTimeout(delay);
+      console.log(`Attempt ${i + 1} to close modal failed: ${error.message}. Retrying in ${delay}ms...`);
     }
+    await page.waitForTimeout(delay);
   }
   console.log("No modal found or failed to close after retries.");
 };
@@ -232,6 +235,8 @@ crawlQueue.process(2, async (job) => {
         }
       });
 
+      page.on("console", (msg) => console.log("PAGE LOG:", msg.text()));
+
       await page.goto(userUrl, { waitUntil: "networkidle", timeout: 90000 });
       await randomSleep(5000, 10000);
 
@@ -247,7 +252,8 @@ crawlQueue.process(2, async (job) => {
         throw new Error("No user elements found.");
       }
       await randomSleep(100, 500);
-      const modalCloseSelector = "div#close_dialog_box";
+      const modalCloseSelector = "#close_dialog_box";
+      const blockingSelector = "window.SidebarOpen";
       for (const element of elements) {
         try {
           console.log(`Processing element...`);
@@ -263,11 +269,12 @@ crawlQueue.process(2, async (job) => {
           if (boundingBox) {
             await moveMouseRandomly(page, boundingBox);
           }
-          await randomSleep(1000, 2000);
+          await randomSleep(3000, 5000);
           await element.click();
           await randomSleep(100, 500);
           console.log("Waiting...");
           await randomSleep(100, 500);
+          await closeModalIfVisible(page, modalCloseSelector, blockingSelector, 5, 2000);
           const currentUrl = await page.url();
           const urlObj = new URL(currentUrl);
           latitude = urlObj.searchParams.get("lat");
@@ -277,7 +284,7 @@ crawlQueue.process(2, async (job) => {
           const maxNextClicks = 20; 
           while (nextClickCount < maxNextClicks) {
             try {
-              await randomSleep(100, 500);
+              await randomSleep(500, 1000);
               const isNextButtonInactive = await page.evaluate((inactiveSelector) => {
                 const button = document.querySelector(inactiveSelector);
                 return button !== null;
